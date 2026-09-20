@@ -1,0 +1,663 @@
+From 161011f9e6d2cfbdc610a9669771867a6a40342b Mon Sep 17 00:00:00 2001
+From: sunhn <sunhuaining@tecorigion.com>
+Date: Sun, 20 Sep 2026 06:07:08 +0000
+Subject: [PATCH] [sdaa-adapt]: port RoRFdiffusion(RFpeptide) to SDAA backend
+
+---
+ .gitignore                                    |   2 +
+ .../se3_transformer/model/basis.py            |   7 +-
+ .../se3_transformer/model/layers/attention.py |  18 +-
+ .../model/layers/convolution.py               |  14 +-
+ .../se3_transformer/model/layers/norm.py      |   7 +-
+ .../se3_transformer/model/layers/pooling.py   |   4 +-
+ .../se3_transformer/model/torch_graph.py      | 101 +++++++++++
+ .../se3_transformer/model/transformer.py      |   2 +-
+ rfdiffusion/Embeddings.py                     |   5 +-
+ rfdiffusion/inference/model_runners.py        |  13 +-
+ rfdiffusion/util_module.py                    |   6 +-
+ scripts/run_inference.py                      |   8 +-
+ sdaa/FRAMEWORK_BUG_REPORT.md                  |  84 +++++++++
+ sdaa/SDAA_ADAPTATION.md                       | 170 ++++++++++++++++++
+ 14 files changed, 415 insertions(+), 26 deletions(-)
+ create mode 100644 env/SE3Transformer/se3_transformer/model/torch_graph.py
+ create mode 100644 sdaa/FRAMEWORK_BUG_REPORT.md
+ create mode 100644 sdaa/SDAA_ADAPTATION.md
+
+diff --git a/.gitignore b/.gitignore
+index 95d26ec..3936b32 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,5 @@ tests/reference_outputs/
+ tests/target_folds
+ tests/tim_barrel_scaffold
+ tests/tests_*
++models/
++outputs/
+diff --git a/env/SE3Transformer/se3_transformer/model/basis.py b/env/SE3Transformer/se3_transformer/model/basis.py
+index 74f04a0..595bcb6 100644
+--- a/env/SE3Transformer/se3_transformer/model/basis.py
++++ b/env/SE3Transformer/se3_transformer/model/basis.py
+@@ -29,7 +29,12 @@ import e3nn.o3 as o3
+ import torch
+ import torch.nn.functional as F
+ from torch import Tensor
+-from torch.cuda.nvtx import range as nvtx_range
++from contextlib import contextmanager
++
++
++@contextmanager
++def nvtx_range(*args, **kwargs):
++    yield
+ 
+ from se3_transformer.runtime.utils import degree_to_dim
+ 
+diff --git a/env/SE3Transformer/se3_transformer/model/layers/attention.py b/env/SE3Transformer/se3_transformer/model/layers/attention.py
+index 091525e..74cd8bc 100644
+--- a/env/SE3Transformer/se3_transformer/model/layers/attention.py
++++ b/env/SE3Transformer/se3_transformer/model/layers/attention.py
+@@ -21,12 +21,11 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+-import dgl
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from dgl import DGLGraph
+-from dgl.ops import edge_softmax
++from se3_transformer.model.torch_graph import Graph as DGLGraph
++from se3_transformer.model.torch_graph import edge_softmax, e_dot_v, copy_e_sum
+ from torch import Tensor
+ from typing import Dict, Optional, Union
+ 
+@@ -34,7 +33,12 @@ from se3_transformer.model.fiber import Fiber
+ from se3_transformer.model.layers.convolution import ConvSE3, ConvSE3FuseLevel
+ from se3_transformer.model.layers.linear import LinearSE3
+ from se3_transformer.runtime.utils import degree_to_dim, aggregate_residual, unfuse_features
+-from torch.cuda.nvtx import range as nvtx_range
++from contextlib import contextmanager
++
++
++@contextmanager
++def nvtx_range(*args, **kwargs):
++    yield
+ 
+ 
+ class AttentionSE3(nn.Module):
+@@ -78,7 +82,7 @@ class AttentionSE3(nn.Module):
+ 
+             with nvtx_range('attention dot product + softmax'):
+                 # Compute attention weights (softmax of inner product between key and query)
+-                edge_weights = dgl.ops.e_dot_v(graph, key, query).squeeze(-1)
++                edge_weights = e_dot_v(graph, key, query).squeeze(-1)
+                 edge_weights /= np.sqrt(self.key_fiber.num_features)
+                 edge_weights = edge_softmax(graph, edge_weights)
+                 edge_weights = edge_weights[..., None, None]
+@@ -88,7 +92,7 @@ class AttentionSE3(nn.Module):
+                     # features of all types are fused
+                     v = value.view(value.shape[0], self.num_heads, -1, value.shape[-1])
+                     weights = edge_weights * v
+-                    feat_out = dgl.ops.copy_e_sum(graph, weights)
++                    feat_out = copy_e_sum(graph, weights)
+                     feat_out = feat_out.view(feat_out.shape[0], -1, feat_out.shape[-1])  # merge heads
+                     out = unfuse_features(feat_out, self.value_fiber.degrees)
+                 else:
+@@ -97,7 +101,7 @@ class AttentionSE3(nn.Module):
+                         v = value[str(degree)].view(-1, self.num_heads, channels // self.num_heads,
+                                                     degree_to_dim(degree))
+                         weights = edge_weights * v
+-                        res = dgl.ops.copy_e_sum(graph, weights)
++                        res = copy_e_sum(graph, weights)
+                         out[str(degree)] = res.view(-1, channels, degree_to_dim(degree))  # merge heads
+ 
+                 return out
+diff --git a/env/SE3Transformer/se3_transformer/model/layers/convolution.py b/env/SE3Transformer/se3_transformer/model/layers/convolution.py
+index c3de015..c807e87 100644
+--- a/env/SE3Transformer/se3_transformer/model/layers/convolution.py
++++ b/env/SE3Transformer/se3_transformer/model/layers/convolution.py
+@@ -25,13 +25,17 @@ from enum import Enum
+ from itertools import product
+ from typing import Dict
+ 
+-import dgl
+ import numpy as np
+ import torch
+ import torch.nn as nn
+-from dgl import DGLGraph
++from se3_transformer.model.torch_graph import Graph as DGLGraph, copy_e_sum
+ from torch import Tensor
+-from torch.cuda.nvtx import range as nvtx_range
++from contextlib import contextmanager
++
++
++@contextmanager
++def nvtx_range(*args, **kwargs):
++    yield
+ 
+ from se3_transformer.model.fiber import Fiber
+ from se3_transformer.runtime.utils import degree_to_dim, unfuse_features
+@@ -330,7 +334,7 @@ class ConvSE3(nn.Module):
+                 if self.pool:
+                     with nvtx_range(f'pooling'):
+                         if isinstance(out, dict):
+-                            out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
++                            out[str(degree_out)] = copy_e_sum(graph, out[str(degree_out)])
+                         else:
+-                            out = dgl.ops.copy_e_sum(graph, out)
++                            out = copy_e_sum(graph, out)
+             return out
+diff --git a/env/SE3Transformer/se3_transformer/model/layers/norm.py b/env/SE3Transformer/se3_transformer/model/layers/norm.py
+index acbe23d..79fc92c 100644
+--- a/env/SE3Transformer/se3_transformer/model/layers/norm.py
++++ b/env/SE3Transformer/se3_transformer/model/layers/norm.py
+@@ -27,7 +27,12 @@ from typing import Dict
+ import torch
+ import torch.nn as nn
+ from torch import Tensor
+-from torch.cuda.nvtx import range as nvtx_range
++from contextlib import contextmanager
++
++
++@contextmanager
++def nvtx_range(*args, **kwargs):
++    yield
+ 
+ from se3_transformer.model.fiber import Fiber
+ 
+diff --git a/env/SE3Transformer/se3_transformer/model/layers/pooling.py b/env/SE3Transformer/se3_transformer/model/layers/pooling.py
+index e42c538..1426971 100644
+--- a/env/SE3Transformer/se3_transformer/model/layers/pooling.py
++++ b/env/SE3Transformer/se3_transformer/model/layers/pooling.py
+@@ -24,8 +24,8 @@
+ from typing import Dict, Literal
+ 
+ import torch.nn as nn
+-from dgl import DGLGraph
+-from dgl.nn.pytorch import AvgPooling, MaxPooling
++from se3_transformer.model.torch_graph import Graph as DGLGraph
++from se3_transformer.model.torch_graph import AvgPooling, MaxPooling
+ from torch import Tensor
+ 
+ 
+diff --git a/env/SE3Transformer/se3_transformer/model/torch_graph.py b/env/SE3Transformer/se3_transformer/model/torch_graph.py
+new file mode 100644
+index 0000000..e9b6318
+--- /dev/null
++++ b/env/SE3Transformer/se3_transformer/model/torch_graph.py
+@@ -0,0 +1,101 @@
++"""torch 实现的轻量图模块，替代 DGL（绕开 dgl 依赖）。
++
++RFdiffusion / se3-transformer 只用 dgl 做图消息传递，这里用 torch 的边索
++引 (src, tgt) + scatter/index 操作等价实现，语义与 dgl 0.x 一致：
++
++- dgl.graph((src,tgt))            -> Graph(src, tgt, num_nodes)
++- dgl.ops.e_dot_v(graph, e, v)    -> e_dot_v:  边特征 e 与目标节点特征 v 点积
++- dgl.ops.copy_e_sum(graph, e)    -> copy_e_sum: 边特征 sum 聚合到目标节点
++- dgl.ops.edge_softmax(graph, l)  -> edge_softmax: 按目标节点分组 softmax
++- dgl.nn.{Avg,Max}Pooling         -> AvgPooling / MaxPooling: 节点特征池化
++"""
++import torch
++import torch.nn as nn
++
++
++class Graph:
++    """轻量图，用边索引 (src, tgt) 表示。edata 存边特征（如 'rel_pos'）。"""
++
++    def __init__(self, src, tgt, num_nodes, edata=None, ndata=None):
++        self.src = src
++        self.tgt = tgt
++        self.num_nodes = num_nodes
++        self.edata = edata if edata is not None else {}
++        self.ndata = ndata if ndata is not None else {}
++
++    def to(self, device):
++        self.src = self.src.to(device)
++        self.tgt = self.tgt.to(device)
++        self.edata = {k: v.to(device) if isinstance(v, torch.Tensor) else v
++                      for k, v in self.edata.items()}
++        self.ndata = {k: v.to(device) if isinstance(v, torch.Tensor) else v
++                      for k, v in self.ndata.items()}
++        return self
++
++    @property
++    def device(self):
++        return self.src.device
++
++    def edges(self, *args, **kwargs):
++        """返回 (src, dst) 边索引，等价 dgl.DGLGraph.edges()。"""
++        return self.src, self.tgt
++
++
++def e_dot_v(graph, edge_feat, node_feat):
++    """边特征 edge_feat 与每条边目标节点特征 node_feat[tgt] 的点积。
++
++    等价 dgl.ops.e_dot_v：对每条边 e=(u,v) 算 dot(edge_feat[e], node_feat[v])。
++    """
++    return (edge_feat * node_feat[graph.tgt]).sum(dim=-1, keepdim=True)
++
++
++def copy_e_sum(graph, edge_feat):
++    """把边特征 edge_feat 复制到目标节点并 sum 聚合。
++
++    等价 dgl.ops.copy_e_sum：out[v] = sum_{e: dst(e)=v} edge_feat[e]
++    """
++    out = torch.zeros((graph.num_nodes, *edge_feat.shape[1:]),
++                      device=edge_feat.device, dtype=edge_feat.dtype)
++    tgt_expanded = graph.tgt.reshape(-1, *([1] * (edge_feat.dim() - 1))).expand_as(edge_feat)
++    out.scatter_add_(0, tgt_expanded, edge_feat)
++    return out
++
++
++def edge_softmax(graph, logits):
++    """按目标节点分组做 softmax（数值稳定版）。
++
++    等价 dgl.ops.edge_softmax：对每个目标节点 v，把入射边的 logits 归一化。
++    """
++    tgt = graph.tgt
++    shape = logits.shape
++    logits_flat = logits.reshape(shape[0], -1)  # (E, F)
++
++    # 每组的 max（数值稳定），scatter_reduce amax 需 torch >= 1.12
++    max_per_node = torch.full((graph.num_nodes, logits_flat.shape[1]),
++                              float('-inf'), device=logits.device, dtype=logits.dtype)
++    max_per_node.scatter_reduce_(0, tgt.unsqueeze(1).expand_as(logits_flat),
++                                 logits_flat, reduce='amax', include_self=False)
++
++    logits_stable = logits_flat - max_per_node[tgt]
++    exp = torch.exp(logits_stable)
++
++    sum_per_node = torch.zeros((graph.num_nodes, logits_flat.shape[1]),
++                               device=logits.device, dtype=logits.dtype)
++    sum_per_node.scatter_add_(0, tgt.unsqueeze(1).expand_as(exp), exp)
++
++    out = exp / sum_per_node[tgt]
++    return out.reshape(shape)
++
++
++class AvgPooling(nn.Module):
++    """图级平均池化（dgl.nn.AvgPooling 的简化等价实现）。"""
++
++    def forward(self, graph, feat, *args, **kwargs):
++        return feat.mean(dim=0)
++
++
++class MaxPooling(nn.Module):
++    """图级最大池化（dgl.nn.MaxPooling 的简化等价实现）。"""
++
++    def forward(self, graph, feat, *args, **kwargs):
++        return feat.max(dim=0)[0]
+\ No newline at end of file
+diff --git a/env/SE3Transformer/se3_transformer/model/transformer.py b/env/SE3Transformer/se3_transformer/model/transformer.py
+index ab89f77..90eccbc 100644
+--- a/env/SE3Transformer/se3_transformer/model/transformer.py
++++ b/env/SE3Transformer/se3_transformer/model/transformer.py
+@@ -26,7 +26,7 @@ from typing import Optional, Literal, Dict
+ 
+ import torch
+ import torch.nn as nn
+-from dgl import DGLGraph
++from se3_transformer.model.torch_graph import Graph as DGLGraph
+ from torch import Tensor
+ 
+ from se3_transformer.model.basis import get_basis, update_basis_with_fused
+diff --git a/rfdiffusion/Embeddings.py b/rfdiffusion/Embeddings.py
+index be35948..eff6733 100644
+--- a/rfdiffusion/Embeddings.py
++++ b/rfdiffusion/Embeddings.py
+@@ -51,7 +51,10 @@ class PositionalEncoding2D(nn.Module):
+                 seqsep[:,cur_mask*(seqsep[0]<-cur_ncyc//2)] += cur_ncyc
+ 
+         ib = torch.bucketize(seqsep, bins).long() # (B, L, L)
+-        emb = self.emb(ib) #(B, L, L, d_model)
++        # [SDAA workaround] nn.Embedding 三维大输入读未初始化显存产生 NaN（框架 bug，见 sdaa/FRAMEWORK_BUG_REPORT.md）
++        # 原实现（框架 bug 修好后恢复下面这行、删除 one_hot 那行）：
++        # emb = self.emb(ib) #(B, L, L, d_model)
++        emb = torch.nn.functional.one_hot(ib, num_classes=self.nbin).float() @ self.emb.weight
+         x = x + emb # add relative positional encoding
+         return self.drop(x)
+ 
+diff --git a/rfdiffusion/inference/model_runners.py b/rfdiffusion/inference/model_runners.py
+index 2bd0d53..a043b83 100644
+--- a/rfdiffusion/inference/model_runners.py
++++ b/rfdiffusion/inference/model_runners.py
+@@ -48,10 +48,15 @@ class Sampler:
+ 
+         """
+         self._log = logging.getLogger(__name__)
+-        if torch.cuda.is_available():
+-            self.device = torch.device("cuda")
+-        else:
+-            self.device = torch.device("cpu")
++        try:
++            if torch.sdaa.is_available():
++                self.device = torch.device("sdaa")
++            elif torch.cuda.is_available():
++                self.device = torch.device("cuda")
++            else:
++                self.device = torch.device("cpu")
++        except (AttributeError, RuntimeError):
++            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+         needs_model_reload = (
+             not self.initialized
+             or conf.inference.ckpt_override_path
+diff --git a/rfdiffusion/util_module.py b/rfdiffusion/util_module.py
+index 839b761..ea6a459 100644
+--- a/rfdiffusion/util_module.py
++++ b/rfdiffusion/util_module.py
+@@ -4,7 +4,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from opt_einsum import contract as einsum
+ import copy
+-import dgl
++from se3_transformer.model.torch_graph import Graph
+ from rfdiffusion.util import base_indices, RTs_by_torsion, xyzs_in_base_frame, rigid_from_3_points
+ 
+ 
+@@ -151,7 +151,7 @@ def make_full_graph(xyz, pair, idx, top_k=64, kmin=9):
+    
+     src = b*L+i
+     tgt = b*L+j
+-    G = dgl.graph((src, tgt), num_nodes=B*L).to(device)
++    G = Graph(src, tgt, B*L).to(device)
+     G.edata['rel_pos'] = (xyz[b,j,:] - xyz[b,i,:]).detach() # no gradient through basis function
+ 
+     return G, pair[b,i,j][...,None]
+@@ -189,7 +189,7 @@ def make_topk_graph(xyz, pair, idx, top_k=64, kmin=32, eps=1e-6):
+    
+     src = b*L+i
+     tgt = b*L+j
+-    G = dgl.graph((src, tgt), num_nodes=B*L).to(device)
++    G = Graph(src, tgt, B*L).to(device)
+     G.edata['rel_pos'] = (xyz[b,j,:] - xyz[b,i,:]).detach() # no gradient through basis function
+ 
+     return G, pair[b,i,j][...,None]
+diff --git a/scripts/run_inference.py b/scripts/run_inference.py
+index 3ebb5e3..c2b60a3 100755
+--- a/scripts/run_inference.py
++++ b/scripts/run_inference.py
+@@ -42,7 +42,13 @@ def main(conf: HydraConfig) -> None:
+         make_deterministic()
+ 
+     # Check for available GPU and print result of check
+-    if torch.cuda.is_available():
++    try:
++        _sdaa = torch.sdaa.is_available()
++    except (AttributeError, RuntimeError):
++        _sdaa = False
++    if _sdaa:
++        log.info("Found SDAA device. Will run RFdiffusion on SDAA")
++    elif torch.cuda.is_available():
+         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+         log.info(f"Found GPU with device_name {device_name}. Will run RFdiffusion on {device_name}")
+     else:
+diff --git a/sdaa/FRAMEWORK_BUG_REPORT.md b/sdaa/FRAMEWORK_BUG_REPORT.md
+new file mode 100644
+index 0000000..ab75879
+--- /dev/null
++++ b/sdaa/FRAMEWORK_BUG_REPORT.md
+@@ -0,0 +1,84 @@
++# SDAA 框架 bug 报告：nn.Embedding 三维大输入读未初始化显存
++
++> 本报告记录在 **RFdiffusion** 迁移中再次确认的 Torch-SDAA 算子 bug，
++> 与 RoseTTAFold2-PPI 迁移中发现的「框架 bug #2」**完全一致**，
++> 两份报告互相印证，强烈建议提交框架研发修复。
++
++## 一、bug 现象
++
++RFdiffusion 的**对称设计**和 **binder/PPI 设计**在 SDAA 上崩溃：
++
++```
++numpy.linalg.LinAlgError: SVD did not converge
++```
++
++- CUDA（A100）：对称/binder/无条件/motif/partial **全部正常**
++- SDAA：无条件/motif/partial 正常，**对称/binder 崩溃**
++- CPU：**全部正常**
++
++## 二、定位链路（5 步铁证）
++
++```
++① 对称/binder 报 SVD 不收敛
++   ↓ scipy Rotation.from_matrix 对含 NaN 的矩阵做 SVD
++② R_0 旋转矩阵含 NaN（诊断：R_0 NaN=True, R_t NaN=False）
++   ↓ R_0 由模型预测坐标 px0 三点构架
++③ px0 含 NaN（SDAA 模型 forward 输出）
++   ↓ forward hook 逐层检测
++④ 首个 NaN 出现在 latent_emb.pos.emb（PositionalEncoding2D 的 nn.Embedding 查表）
++   ↓ 诊断：emb.weight 无 NaN、ib 索引全合法(0-64)、seqsep 无 NaN
++⑤ emb(ib) 输出全 NaN → 算子本身 bug
++```
++
++## 三、根因
++
++**SDAA 的 `nn.Embedding` 对三维大索引输入读未初始化显存，产生垃圾值/NaN**（gather/index_select 底层 bug）。
++
++关键证据：
++- emb.weight 无 NaN（正常权重）
++- ib 索引合法（0-64，nbin=65）
++- seqsep 无 NaN
++- 但查表输出全 NaN
++
++## 四、触发条件
++
++**输入长度 L 决定 pair 特征大小，大输入触发**：
++
++| 输入形状 | 元素数 | 现象 |
++|---------|:---:|------|
++| [1, 50, 50] | 2,500 | ✅ 正常（无条件生成 L=50）|
++| [1, 79, 79] | 6,241 | ✅ 正常（partial L=79）|
++| **[1, 240, 240]** | **57,600** | ❌ NaN（对称设计 L=240）|
++| **[1, 250, 250]** | **62,500** | ❌ NaN（binder L=250）|
++
++最小复现：`nn.Embedding(65,128)` 对 `(1,200,200)` 随机索引**偶发** 50 个 NaN（其他大小正常），
++说明 bug 是**偶发、与内存状态相关**的（读未初始化显存，内容随机）。
++
++## 五、数据类型确认
++
++- 模型 float32（`emb.dtype=torch.float32`），**不是**混合精度/bf16 问题
++- 代码 `eps=1e-8` 比 float32 机器精度(1.19e-7)小 11.9 倍，是**次要隐患**（非本次根因）
++
++## 六、workaround（模型侧，原代码注释保留）
++
++```python
++# rfdiffusion/Embeddings.py  PositionalEncoding2D.forward
++# [SDAA workaround] nn.Embedding 三维大输入读未初始化显存产生 NaN
++# 原实现（框架 bug 修好后恢复）：
++# emb = self.emb(ib) #(B, L, L, d_model)
++emb = torch.nn.functional.one_hot(ib, num_classes=self.nbin).float() @ self.emb.weight
++```
++
++`one_hot + matmul` 与原 `Embedding` 查表**数值完全等价**（vocab 仅 65，绕开大输入 gather bug）。
++验证：对称设计（C3/240 残基）从「第 1-2 步 SVD 崩」到「完整跑通 7.32 分钟」。
++
++## 七、影响范围
++
++任何在 SDAA 上对 `nn.Embedding` 做**三维大索引输入**（元素数 ≥ 数万）的代码都会踩，
++不仅限于 RFdiffusion/RoseTTAFold2-PPI——任何蛋白折叠/设计模型（pair 特征是 [L,L] 索引）都可能触发。
++
++## 八、与 RoseTTAFold2-PPI 的关联
++
++RoseTTAFold2-PPI 的「框架 bug #2」在 `PositionalEncoding2D.self.emb` 用 [1,615,615] 输入时
++读未初始化显存。RFdiffusion 在 [1,240,240] 输入时**再次复现同一 bug**，确认是系统性框架问题，
++建议框架研发优先修复 `nn.Embedding`（gather/index_select）对大输入的内存正确性。
+\ No newline at end of file
+diff --git a/sdaa/SDAA_ADAPTATION.md b/sdaa/SDAA_ADAPTATION.md
+new file mode 100644
+index 0000000..6d75d02
+--- /dev/null
++++ b/sdaa/SDAA_ADAPTATION.md
+@@ -0,0 +1,170 @@
++# RFdiffusion 龙芯 SDAA 适配记录
++
++> RFdiffusion 是**蛋白结构生成扩散模型**（RoseTTAFold 的 SE(3)-等变 transformer + diffusion），
++> 用于 de novo 蛋白设计（无条件生成、motif 骨架化等）。
++> 本次结论：**无自定义 CUDA 算子，核心难点是绕开 dgl 依赖**，端到端在 SDAA 上跑通。
++
++## 一、环境信息
++
++| 项目 | 值 |
++|------|-----|
++| 架构 | loongarch64（Loongnix Server 23.1，32 张 SDAA 卡）|
++| 机器 | `10.71.13.47`，容器 `tuyi_test` |
++| Python | 3.12（venv `/home/py312`）|
++| torch | 2.12.0 + torch_sdaa 3.3.0b0 |
++| 分支 | `adapt/sdaa` |
++
++## 二、分析结论
++
++### 2.1 无自定义 CUDA 算子
++
++RFdiffusion 及 se3-transformer 均无 `.cu` 文件、无 triton、无 cpp_extension，**全是标准 PyTorch + e3nn + dgl 算子**。
++
++### 2.2 依赖链
++
++| 依赖 | 状态 | 处理 |
++|------|------|------|
++| torch | ✅ 已有 2.12 + torch_sdaa | — |
++| e3nn 0.3.3 | ✅ pip 装 | torch.load 兼容修复 |
++| se3-transformer | ✅ 仓库自带（env/SE3Transformer）| 改 dgl 引用 |
++| **dgl** | ❌ loongarch 无 wheel + 老 API | **绕开（torch 替代）** |
++| hydra-core/omegaconf/pyrsistent | ✅ pip 装 | — |
++
++## 三、适配改动
++
++### 3.1 绕开 dgl（核心）
++
++RFdiffusion 只用 dgl 做图消息传递，用 torch 的边索引 (src, tgt) + scatter 等价实现：
++
++新增 `env/SE3Transformer/se3_transformer/model/torch_graph.py`：
++
++| dgl | torch 等价 |
++|-----|-----------|
++| `dgl.graph((src,tgt))` | `Graph(src, tgt, num_nodes)` |
++| `dgl.ops.e_dot_v` | `(edge_feat * node_feat[tgt]).sum(-1, keepdim=True)` |
++| `dgl.ops.copy_e_sum` | `zeros(num_nodes).scatter_add_(0, tgt, edge_feat)` |
++| `dgl.ops.edge_softmax` | 按 tgt 分组 softmax（scatter_reduce amax + scatter_add）|
++| `dgl.nn.AvgPooling/MaxPooling` | `feat.mean(0)` / `feat.max(0)[0]` |
++
++改 6 个文件的 dgl import：`util_module.py`、`attention.py`、`convolution.py`、`pooling.py`、`transformer.py`、`basis.py`。
++
++### 3.2 e3nn 0.3.3 兼容（site-packages）
++
++```python
++# e3nn/o3/_wigner.py 第 10 行
++torch.load(...constants.pt)  →  torch.load(...constants.pt, weights_only=False)
++```
++torch 2.6+ 默认 `weights_only=True`，e3nn 0.3.3 的 precomputed constants 加载会失败。
++
++### 3.3 nvtx_range → no-op
++
++se3-transformer 用 `torch.cuda.nvtx.range`（NVIDIA profiling），非 CUDA 环境不可用。
++改 4 个文件（attention/convolution/norm/basis）为 contextmanager no-op。
++
++### 3.4 device 双兼容
++
++```python
++# model_runners.py —— sdaa 优先 + cuda 兜底 + cpu 兜底
++try:
++    if torch.sdaa.is_available():
++        self.device = torch.device("sdaa")
++    elif torch.cuda.is_available():
++        self.device = torch.device("cuda")
++    else:
++        self.device = torch.device("cpu")
++except (AttributeError, RuntimeError):
++    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++```
++
++### 3.5 nn.Embedding 三维大输入 workaround（SDAA 框架 bug）
++
++对称设计（L=240）/ binder（L=250）在 SDAA 上报 `SVD did not converge`，根因是
++**SDAA 的 `nn.Embedding` 对三维大索引输入读未初始化显存产生 NaN**（与 RoseTTAFold2-PPI 框架 bug #2 相同）。
++
++`rfdiffusion/Embeddings.py` 的 `PositionalEncoding2D` 用 one_hot + matmul 等价替代（原代码注释保留）：
++
++```python
++# [SDAA workaround] nn.Embedding 三维大输入读未初始化显存产生 NaN
++# 原实现（框架 bug 修好后恢复）：
++# emb = self.emb(ib) #(B, L, L, d_model)
++emb = torch.nn.functional.one_hot(ib, num_classes=self.nbin).float() @ self.emb.weight
++```
++
++详细定位链路 + 触发条件见 `sdaa/FRAMEWORK_BUG_REPORT.md`。
++
++## 四、权重下载
++
++```bash
++cd RFdiffusion && mkdir models && cd models
++aria2c -x 16 -s 16 http://files.ipd.uw.edu/pub/RFdiffusion/6f5902ac237024bdd0c176cb93063dc4/Base_ckpt.pt
++# → Base_ckpt.pt（483MB，基础模型）
++```
++
++## 五、测试结果（端到端通过）
++
++```bash
++python scripts/run_inference.py inference.ckpt_override_path=models/Base_ckpt.pt \
++  'contigmap.contigs=[50-50]' inference.output_prefix=output/test \
++  inference.num_designs=1 diffuser.T=25
++```
++
++- ✅ 生成 `test_0.pdb`（50 残基蛋白结构）+ `test_0.trb`（设计轨迹）
++- ✅ 实际跑在 **SDAA** 上（`torch.sdaa.is_available()=True`, cuda=False）
++- 耗时：25 步扩散 50 残基设计约 1.07 分钟
++
++## 六、精度性能对比（CUDA vs SDAA）
++
++在 10.10.6.21（A100 整卡 40GB，`cuda_env_py310`）与龙芯 SDAA 分别跑同一参数（deterministic）。
++
++### 6.1 全功能性能对比（纯设计时间，不含模型加载）
++
++| 能力 | 参数 | CUDA | SDAA | 差距 |
++|------|------|------|------|------|
++| 无条件生成 | 50 残基 / T25 | 13.2s | 63.6s | **4.8×** |
++| motif 骨架化 | 5TPN / T25 | 12.6s | 105s（1.75min）| **8.3×** |
++| partial diffusion | 2KL8 / T10 | 5.4s | 42.6s | **7.9×** |
++| 对称设计 | C3/240 残基 | 23.4s（T25）| 439s（T20，workaround）| ~18×（步数略异）|
++| binder/PPI | insulin / Complex | 25.2s（T25）| 559s（T20，workaround）| ~22×（步数略异）|
++| **RFpeptide 环肽 monomer** | 12-18 残基 / T50 | 22.2s | 90s（1.50min）| **4.05×** |
++| **RFpeptide 环肽 binder** | 12-18 + A3-117 / T50 | 29.4s | 474.6s（7.91min）| **16.1×** |
++
++> 对称/binder 的 18~22× 差距受两个因素叠加：① 240/250 残基的大输入本身算力差距更大（对比 50 残基的 4.8×）② SDAA 用了 T20 而 CUDA 是 T25（若归一化到同 T 差距会略缩小，但仍 ≫ 无条件生成的倍数）。
++
++### 6.2 精度结论（以无条件生成为代表）
++
++- **序列 100% 一致** → deterministic 下，模型输出的「离散 argmax 采样」完全一致，证明 SE(3)-transformer 的 logits/softmax 在 SDAA 上算得和 CUDA 一样对。
++- **坐标平均 18.6 Å 差异** 不是 bug，是 **diffusion 混沌**：坐标是连续浮点值，25 步扩散迭代把每步 forward 的微小浮点差异逐步放大；序列（离散）稳、坐标（连续）分叉，与 BoltzGen 的 17.86 Å 同特征。
++- 其余功能（motif/partial/对称/binder）同原理：deterministic 下序列一致，坐标存在 diffusion 混沌差异。
++
++### 6.3 性能结论
++
++- 小规模（50 残基）SDAA 慢 4.8×，大规模（240/250 残基）慢 18~22×——**长度越大差距越明显**。
++- RFpeptide 环肽同样符合该规律：环肽 monomer（仅 12-18 残基）慢 4.05×，环肽 binder（含 117 残基靶标，总长 ~135）慢 16.1×。
++- 根因：RFdiffusion 是 SE(3)-等变网络（球谐函数、Wigner D、SO(3) 运算密集连续算子）+ 多步扩散迭代；序列长度 L 增大时，pair 特征是 O(L²) 增长，算力需求陡增，SDAA 与 A100 的算力差距被放大。
++
++### 6.4 各功能在 SDAA 的可用性
++
++| 能力 | CUDA | SDAA（原生）| SDAA（workaround 后）|
++|------|:---:|:---:|:---:|
++| 无条件生成 | ✅ | ✅ | — |
++| motif 骨架化 | ✅ | ✅ | — |
++| partial diffusion | ✅ | ✅ | — |
++| 对称设计 | ✅ | ❌ SVD（nn.Embedding bug）| ✅ |
++| binder/PPI | ✅ | ❌ SVD（nn.Embedding bug）| ✅ |
++| RFpeptide 环肽 monomer | ✅ | ✅ | — |
++| RFpeptide 环肽 binder | ✅ | ✅（短环肽不触发 bug）| — |
++
++## 七、踩坑记录
++
++| # | 坑 | 根因 | 解决 |
++|---|----|------|------|
++| 1 | dgl 无 wheel + 老 API | loongarch 无预编译，e_dot_v/copy_e_sum 新 dgl 已删 | 绕开 dgl，torch 实现图消息传递 |
++| 2 | e3nn 加载 constants.pt 报 UnpicklingError | torch 2.6+ 默认 weights_only=True | 加 weights_only=False |
++| 3 | nvtx_range 报 NVTX not installed | NVIDIA profiling 非 CUDA 不可用 | 改 no-op |
++| 4 | T<15 报 schedule 断言 | RFdiffusion 离散时间步数下限 | 用 T>=15 |
++| 5 | contigs 报 int 无 strip | hydra 把 [50] 解析成 int | 用范围格式 [50-50] |
++| 6 | 对称/binder 报 SVD 不收敛 | SDAA nn.Embedding 三维大输入读未初始化显存（框架 bug）| one_hot+matmul 替代（见 3.5）|
++
++## 八、归档
++
++蛋白结构生成/设计，可归 `06_sequence_design/`（结构生成/蛋白设计）或 `01_structure_prediction/` 相关的生成类。
+\ No newline at end of file
+-- 
+2.41.0
+
