@@ -25,13 +25,17 @@ from enum import Enum
 from itertools import product
 from typing import Dict
 
-import dgl
 import numpy as np
 import torch
 import torch.nn as nn
-from dgl import DGLGraph
+from se3_transformer.model.torch_graph import Graph as DGLGraph, copy_e_sum
 from torch import Tensor
-from torch.cuda.nvtx import range as nvtx_range
+from contextlib import contextmanager
+
+
+@contextmanager
+def nvtx_range(*args, **kwargs):
+    yield
 
 from se3_transformer.model.fiber import Fiber
 from se3_transformer.runtime.utils import degree_to_dim, unfuse_features
@@ -330,7 +334,7 @@ class ConvSE3(nn.Module):
                 if self.pool:
                     with nvtx_range(f'pooling'):
                         if isinstance(out, dict):
-                            out[str(degree_out)] = dgl.ops.copy_e_sum(graph, out[str(degree_out)])
+                            out[str(degree_out)] = copy_e_sum(graph, out[str(degree_out)])
                         else:
-                            out = dgl.ops.copy_e_sum(graph, out)
+                            out = copy_e_sum(graph, out)
             return out

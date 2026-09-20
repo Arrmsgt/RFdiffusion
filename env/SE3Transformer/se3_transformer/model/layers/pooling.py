@@ -24,8 +24,8 @@
 from typing import Dict, Literal
 
 import torch.nn as nn
-from dgl import DGLGraph
-from dgl.nn.pytorch import AvgPooling, MaxPooling
+from se3_transformer.model.torch_graph import Graph as DGLGraph
+from se3_transformer.model.torch_graph import AvgPooling, MaxPooling
 from torch import Tensor
 
 

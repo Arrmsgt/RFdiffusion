@@ -48,10 +48,15 @@ class Sampler:
 
         """
         self._log = logging.getLogger(__name__)
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        try:
+            if torch.sdaa.is_available():
+                self.device = torch.device("sdaa")
+            elif torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            else:
+                self.device = torch.device("cpu")
+        except (AttributeError, RuntimeError):
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         needs_model_reload = (
             not self.initialized
             or conf.inference.ckpt_override_path

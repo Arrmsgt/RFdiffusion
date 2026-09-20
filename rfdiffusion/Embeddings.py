@@ -51,7 +51,10 @@ class PositionalEncoding2D(nn.Module):
                 seqsep[:,cur_mask*(seqsep[0]<-cur_ncyc//2)] += cur_ncyc
 
         ib = torch.bucketize(seqsep, bins).long() # (B, L, L)
-        emb = self.emb(ib) #(B, L, L, d_model)
+        # [SDAA workaround] nn.Embedding 三维大输入读未初始化显存产生 NaN（框架 bug，见 sdaa/FRAMEWORK_BUG_REPORT.md）
+        # 原实现（框架 bug 修好后恢复下面这行、删除 one_hot 那行）：
+        # emb = self.emb(ib) #(B, L, L, d_model)
+        emb = torch.nn.functional.one_hot(ib, num_classes=self.nbin).float() @ self.emb.weight
         x = x + emb # add relative positional encoding
         return self.drop(x)
 

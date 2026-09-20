@@ -42,7 +42,13 @@ def main(conf: HydraConfig) -> None:
         make_deterministic()
 
     # Check for available GPU and print result of check
-    if torch.cuda.is_available():
+    try:
+        _sdaa = torch.sdaa.is_available()
+    except (AttributeError, RuntimeError):
+        _sdaa = False
+    if _sdaa:
+        log.info("Found SDAA device. Will run RFdiffusion on SDAA")
+    elif torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
         log.info(f"Found GPU with device_name {device_name}. Will run RFdiffusion on {device_name}")
     else:

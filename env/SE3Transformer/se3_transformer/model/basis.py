@@ -29,7 +29,12 @@ import e3nn.o3 as o3
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.nvtx import range as nvtx_range
+from contextlib import contextmanager
+
+
+@contextmanager
+def nvtx_range(*args, **kwargs):
+    yield
 
 from se3_transformer.runtime.utils import degree_to_dim
 
